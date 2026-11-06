@@ -1,0 +1,1381 @@
+--- a/applications/utilities/parallelProcessing/decomposePar/decomposePar.C
++++ b/applications/utilities/parallelProcessing/decomposePar/decomposePar.C
+@@ -410,6 +410,12 @@
+ 
+     argList::addBoolOption
+     (
++        "readProcMeshes",
++        "Read processor meshes back from disk for field decomposition"
++        " (original behaviour)"
++    );
++    argList::addBoolOption
++    (
+         "cellDist",
+         "Write cell distribution as a labelList - for use with 'manual' "
+         "decomposition method and as a volScalarField for visualization."
+@@ -912,6 +918,19 @@
+             PtrList<labelIOList> pointBoundaryProcAddressingList(numProcs);
+ 
+             PtrList<fvFieldDecomposer> fieldDecomposerList(numProcs);
++
++            // Rebuild processor meshes in memory instead of reading back
++            const bool inMemoryProcMeshes =
++            (
++                !decomposeFieldsOnly
++             && !args.found("readProcMeshes")
++             && mesh.canBuildProcMeshes()
++            );
++            if (inMemoryProcMeshes)
++            {
++                Info<< "Field decomposition uses in-memory processor meshes"
++                    << nl;
++            }
+             PtrList<pointFieldDecomposer> pointFieldDecomposerList(numProcs);
+ 
+ 
+@@ -1263,6 +1282,70 @@
+                         emplaceTime(processorDbList, proci, args);
+                     processorDb.setTime(runTime);
+ 
++                    // Processor mesh and addressing: rebuild in memory from
++                    // the decomposition when available. Reading them back
++                    // costs O(proci) per file for collated (block skipping).
++                    if (inMemoryProcMeshes && !procMeshList.test(proci))
++                    {
++                        procMeshList.set
++                        (
++                            proci,
++                            mesh.processorFvMesh(proci, processorDb)
++                        );
++
++                        const auto& pm = procMeshList[proci];
++                        auto setAddr =
++                        [&](PtrList<labelIOList>& lst, const word& name,
++                            const labelUList& addr)
++                        {
++                            lst.resize(numProcs);
++                            lst.set
++                            (
++                                proci,
++                                new labelIOList
++                                (
++                                    IOobject
++                                    (
++                                        name,
++                                        pm.facesInstance(),
++                                        polyMesh::meshSubDir,
++                                        pm,
++                                        IOobjectOption::NO_READ,
++                                        IOobjectOption::NO_WRITE,
++                                        IOobjectOption::NO_REGISTER
++                                    ),
++                                    addr
++                                )
++                            );
++                        };
++                        setAddr
++                        (
++                            faceProcAddressingList, "faceProcAddressing",
++                            mesh.procFaceAddressing(proci)
++                        );
++                        setAddr
++                        (
++                            cellProcAddressingList, "cellProcAddressing",
++                            mesh.procCellAddressing(proci)
++                        );
++                        setAddr
++                        (
++                            boundaryProcAddressingList,
++                            "boundaryProcAddressing",
++                            mesh.procBoundaryAddressing(proci)
++                        );
++                        if (!pointFieldCache.empty())
++                        {
++                            // (cleared again after the point fields)
++                            setAddr
++                            (
++                                pointProcAddressingList,
++                                "pointProcAddressing",
++                                mesh.procPointAddressing(proci)
++                            );
++                        }
++                    }
++
+                     // Read the mesh
+                     const auto& procMesh = procMeshList.try_emplace
+                     (
+--- a/applications/utilities/parallelProcessing/decomposePar/domainDecomposition.C
++++ b/applications/utilities/parallelProcessing/decomposePar/domainDecomposition.C
+@@ -49,6 +49,7 @@
+ #include "meshPointPatch.H"
+ #include "processorPointPatch.H"
+ #include "DynamicField.H"
++#include <type_traits>
+ 
+ // * * * * * * * * * * * * * Private Member Functions  * * * * * * * * * * * //
+ 
+@@ -148,9 +149,21 @@
+ }
+ 
+ 
+-bool Foam::domainDecomposition::writeDecomposition(const bool decomposeSets)
++// * * * * * * * * * * * * Processor mesh construction  * * * * * * * * * * //
++
++void Foam::domainDecomposition::initProcMeshBuild() const
+ {
+-    Info<< "\nConstructing processor meshes" << endl;
++    if (procMeshBuildReady_)
++    {
++        return;
++    }
++
++    // Full-mesh-size inverse lookups, allocated once and reset after each
++    // processor (only the touched entries): avoids O(nProcs*(nPoints+nFaces))
++    pointLookup_.resize_nocopy(nPoints());
++    pointLookup_ = -1;
++    faceLookup_.resize_nocopy(nFaces());
++    faceLookup_ = -1;
+ 
+     // Mark point/faces/cells that are in zones.
+     // -1   : not in zone
+@@ -161,580 +174,670 @@
+     // for the duplicate elements
+ 
+     // Point zones
+-    labelList pointToZone(points().size(), -1);
++    pointToZone_.resize_nocopy(points().size());
++    pointToZone_ = -1;
+ 
+     forAll(pointZones(), zonei)
+     {
+-        mark(pointZones()[zonei], zonei, pointToZone);
++        mark(pointZones()[zonei], zonei, pointToZone_);
+     }
+ 
+     // Face zones
+-    labelList faceToZone(faces().size(), -1);
++    faceToZone_.resize_nocopy(faces().size());
++    faceToZone_ = -1;
+ 
+     forAll(faceZones(), zonei)
+     {
+-        mark(faceZones()[zonei], zonei, faceToZone);
++        mark(faceZones()[zonei], zonei, faceToZone_);
+     }
+ 
+     // Cell zones
+-    labelList cellToZone(nCells(), -1);
++    cellToZone_.resize_nocopy(nCells());
++    cellToZone_ = -1;
+ 
+     forAll(cellZones(), zonei)
+     {
+-        mark(cellZones()[zonei], zonei, cellToZone);
++        mark(cellZones()[zonei], zonei, cellToZone_);
+     }
+ 
+ 
+-    PtrDynList<const cellSet> cellSets;
+-    PtrDynList<const faceSet> faceSets;
+-    PtrDynList<const pointSet> pointSets;
+-    if (decomposeSets)
++    procMeshBuildReady_ = true;
++}
++
++
++void Foam::domainDecomposition::resetProcMeshBuild(const label proci) const
++{
++    UIndirectList<label>(pointLookup_, procPointAddressing_[proci]) = -1;
++    for (const label facei : procFaceAddressing_[proci])
+     {
+-        // Read sets
+-        IOobjectList objects(*this, facesInstance(), "polyMesh/sets");
+-        for (const IOobject& io : objects.csorted<cellSet>())
+-        {
+-            cellSets.emplace_back(io);
+-        }
+-        for (const IOobject& io : objects.csorted<faceSet>())
+-        {
+-            faceSets.emplace_back(io);
+-        }
+-        for (const IOobject& io : objects.csorted<pointSet>())
+-        {
+-            pointSets.emplace_back(io);
+-        }
++        faceLookup_[mag(facei) - 1] = -1;
+     }
++}
+ 
+ 
+-    // Load refinement data (if any)
+-    hexRef8Data baseMeshData
+-    (
+-        IOobject
+-        (
+-            "dummy",
+-            facesInstance(),
+-            polyMesh::meshSubDir,
+-            *this,
+-            IOobjectOption::READ_IF_PRESENT,
+-            IOobjectOption::NO_WRITE,
+-            IOobjectOption::NO_REGISTER
+-        )
+-    );
++template<class MeshType>
++Foam::autoPtr<MeshType> Foam::domainDecomposition::buildProcMesh
++(
++    const label proci,
++    const Time& processorDb
++) const
++{
++    initProcMeshBuild();
+ 
++    // Create processor points
++    const labelList& curPointLabels = procPointAddressing_[proci];
+ 
+-    label maxProcCells = 0;
+-    label maxProcFaces = 0;
+-    label totProcFaces = 0;
+-    label maxProcPatches = 0;
+-    label totProcPatches = 0;
++    pointField procPoints(points(), curPointLabels);
+ 
+-    // Write out the meshes
+-    for (label proci = 0; proci < nProcs_; proci++)
++    forAll(curPointLabels, pointi)
+     {
+-        // Create processor points
+-        const labelList& curPointLabels = procPointAddressing_[proci];
+-
+-        pointField procPoints(points(), curPointLabels);
++        pointLookup_[curPointLabels[pointi]] = pointi;
++    }
+ 
+-        labelList pointLookup(nPoints(), -1);
++    // Create processor faces
++    const labelList& curFaceLabels = procFaceAddressing_[proci];
+ 
+-        forAll(curPointLabels, pointi)
+-        {
+-            pointLookup[curPointLabels[pointi]] = pointi;
+-        }
++    const faceList& meshFaces = faces();
+ 
+-        // Create processor faces
+-        const labelList& curFaceLabels = procFaceAddressing_[proci];
++    faceList procFaces(curFaceLabels.size());
+ 
+-        const faceList& meshFaces = faces();
++    forAll(curFaceLabels, facei)
++    {
++        // Mark the original face as used
++        // Remember to decrement the index by one (turning index)
++        label curF = mag(curFaceLabels[facei]) - 1;
+ 
+-        labelList faceLookup(nFaces(), -1);
++        faceLookup_[curF] = facei;
+ 
+-        faceList procFaces(curFaceLabels.size());
++        // get the original face
++        labelList origFaceLabels;
+ 
+-        forAll(curFaceLabels, facei)
++        if (curFaceLabels[facei] >= 0)
+         {
+-            // Mark the original face as used
+-            // Remember to decrement the index by one (turning index)
+-            label curF = mag(curFaceLabels[facei]) - 1;
++            // face not turned
++            origFaceLabels = meshFaces[curF];
++        }
++        else
++        {
++            origFaceLabels = meshFaces[curF].reverseFace();
++        }
+ 
+-            faceLookup[curF] = facei;
++        // translate face labels into local point list
++        face& procFaceLabels = procFaces[facei];
+ 
+-            // get the original face
+-            labelList origFaceLabels;
++        procFaceLabels.setSize(origFaceLabels.size());
+ 
+-            if (curFaceLabels[facei] >= 0)
+-            {
+-                // face not turned
+-                origFaceLabels = meshFaces[curF];
+-            }
+-            else
+-            {
+-                origFaceLabels = meshFaces[curF].reverseFace();
+-            }
++        forAll(origFaceLabels, pointi)
++        {
++            procFaceLabels[pointi] = pointLookup_[origFaceLabels[pointi]];
++        }
++    }
+ 
+-            // translate face labels into local point list
+-            face& procFaceLabels = procFaces[facei];
++    // Create processor cells
++    const labelList& curCellLabels = procCellAddressing_[proci];
+ 
+-            procFaceLabels.setSize(origFaceLabels.size());
++    const cellList& meshCells = cells();
+ 
+-            forAll(origFaceLabels, pointi)
+-            {
+-                procFaceLabels[pointi] = pointLookup[origFaceLabels[pointi]];
+-            }
+-        }
++    cellList procCells(curCellLabels.size());
+ 
+-        // Create processor cells
+-        const labelList& curCellLabels = procCellAddressing_[proci];
++    forAll(curCellLabels, celli)
++    {
++        const labelList& origCellLabels = meshCells[curCellLabels[celli]];
+ 
+-        const cellList& meshCells = cells();
++        cell& curCell = procCells[celli];
+ 
+-        cellList procCells(curCellLabels.size());
++        curCell.setSize(origCellLabels.size());
+ 
+-        forAll(curCellLabels, celli)
++        forAll(origCellLabels, cellFacei)
+         {
+-            const labelList& origCellLabels = meshCells[curCellLabels[celli]];
++            curCell[cellFacei] = faceLookup_[origCellLabels[cellFacei]];
++        }
++    }
+ 
+-            cell& curCell = procCells[celli];
++    // Create processor mesh without a boundary
+ 
+-            curCell.setSize(origCellLabels.size());
+ 
+-            forAll(origCellLabels, cellFacei)
+-            {
+-                curCell[cellFacei] = faceLookup[origCellLabels[cellFacei]];
+-            }
+-        }
++    // create the mesh. Two situations:
++    // - points and faces come from the same time ('instance'). The mesh
++    //   will get constructed in the same instance.
++    // - points come from a different time (moving mesh cases).
++    //   It will read the points belonging to the faces instance and
++    //   construct the procMesh with it which then gets handled as above.
++    //   (so with 'old' geometry).
++    //   Only at writing time will it additionally write the current
++    //   points.
+ 
+-        // Create processor mesh without a boundary
++    autoPtr<MeshType> procMeshPtr;
+ 
+-        // create a database
+-        Time processorDb
++    if (facesInstancePointsPtr_)
++    {
++        // Construct mesh from facesInstance.
++        pointField facesInstancePoints
+         (
+-            Time::controlDictName,
+-            time().rootPath(),
+-            time().caseName()/("processor" + Foam::name(proci)),
+-            false,  // No function objects
+-            false   // No extra controlDict libs
++            facesInstancePointsPtr_(),
++            curPointLabels
+         );
+-        processorDb.setTime(time());
+-
+-        // create the mesh. Two situations:
+-        // - points and faces come from the same time ('instance'). The mesh
+-        //   will get constructed in the same instance.
+-        // - points come from a different time (moving mesh cases).
+-        //   It will read the points belonging to the faces instance and
+-        //   construct the procMesh with it which then gets handled as above.
+-        //   (so with 'old' geometry).
+-        //   Only at writing time will it additionally write the current
+-        //   points.
+-
+-        autoPtr<polyMesh> procMeshPtr;
+ 
+-        if (facesInstancePointsPtr_)
+-        {
+-            // Construct mesh from facesInstance.
+-            pointField facesInstancePoints
+-            (
+-                facesInstancePointsPtr_(),
+-                curPointLabels
+-            );
+-
+-            procMeshPtr = autoPtr<polyMesh>::New
++        procMeshPtr = autoPtr<MeshType>::New
++        (
++            IOobject
+             (
+-                IOobject
+-                (
+-                    this->polyMesh::name(), // region of undecomposed mesh
+-                    facesInstance(),
+-                    processorDb,
+-                    IOobject::NO_READ,
+-                    IOobject::AUTO_WRITE
+-                ),
+-                std::move(facesInstancePoints),
+-                std::move(procFaces),
+-                std::move(procCells)
+-            );
+-        }
+-        else
+-        {
+-            procMeshPtr = autoPtr<polyMesh>::New
++                this->polyMesh::name(), // region of undecomposed mesh
++                facesInstance(),
++                processorDb,
++                IOobject::NO_READ,
++                IOobject::AUTO_WRITE
++            ),
++            std::move(facesInstancePoints),
++            std::move(procFaces),
++            std::move(procCells)
++        );
++    }
++    else
++    {
++        procMeshPtr = autoPtr<MeshType>::New
++        (
++            IOobject
+             (
+-                IOobject
+-                (
+-                    this->polyMesh::name(), // region of undecomposed mesh
+-                    facesInstance(),
+-                    processorDb,
+-                    IOobject::NO_READ,
+-                    IOobject::AUTO_WRITE
+-                ),
+-                std::move(procPoints),
+-                std::move(procFaces),
+-                std::move(procCells)
+-            );
+-        }
+-        polyMesh& procMesh = procMeshPtr();
++                this->polyMesh::name(), // region of undecomposed mesh
++                facesInstance(),
++                processorDb,
++                IOobject::NO_READ,
++                IOobject::AUTO_WRITE
++            ),
++            std::move(procPoints),
++            std::move(procFaces),
++            std::move(procCells)
++        );
++    }
++    MeshType& procMesh = procMeshPtr();
+ 
+ 
+-        // Create processor boundary patches
+-        const labelList& curPatchSizes = procPatchSize_[proci];
++    // Create processor boundary patches
++    const labelList& curPatchSizes = procPatchSize_[proci];
+ 
+-        const labelList& curPatchStarts = procPatchStartIndex_[proci];
++    const labelList& curPatchStarts = procPatchStartIndex_[proci];
+ 
+-        const labelList& curNeighbourProcessors =
+-            procNeighbourProcessors_[proci];
++    const labelList& curNeighbourProcessors =
++        procNeighbourProcessors_[proci];
+ 
+-        const labelList& curProcessorPatchSizes =
+-            procProcessorPatchSize_[proci];
++    const labelList& curProcessorPatchSizes =
++        procProcessorPatchSize_[proci];
+ 
+-        const labelList& curProcessorPatchStarts =
+-            procProcessorPatchStartIndex_[proci];
++    const labelList& curProcessorPatchStarts =
++        procProcessorPatchStartIndex_[proci];
+ 
+-        const labelListList& curSubPatchIDs =
+-            procProcessorPatchSubPatchIDs_[proci];
++    const labelListList& curSubPatchIDs =
++        procProcessorPatchSubPatchIDs_[proci];
+ 
+-        const labelListList& curSubStarts =
+-            procProcessorPatchSubPatchStarts_[proci];
++    const labelListList& curSubStarts =
++        procProcessorPatchSubPatchStarts_[proci];
+ 
+-        const polyPatchList& meshPatches = boundaryMesh();
++    const polyPatchList& meshPatches = boundaryMesh();
+ 
+ 
+-        // Count the number of inter-proc patches
+-        label nInterProcPatches = 0;
+-        forAll(curSubPatchIDs, procPatchi)
+-        {
+-            nInterProcPatches += curSubPatchIDs[procPatchi].size();
+-        }
++    // Count the number of inter-proc patches
++    label nInterProcPatches = 0;
++    forAll(curSubPatchIDs, procPatchi)
++    {
++        nInterProcPatches += curSubPatchIDs[procPatchi].size();
++    }
+ 
+-        polyPatchList procPatches
+-        (
+-            curPatchSizes.size() + nInterProcPatches
+-        );
++    polyPatchList procPatches
++    (
++        curPatchSizes.size() + nInterProcPatches
++    );
+ 
+-        label nPatches = 0;
++    label nPatches = 0;
+ 
+-        forAll(curPatchSizes, patchi)
+-        {
+-            // Get the face labels consistent with the field mapping
+-            // (reuse the patch field mappers)
+-            const polyPatch& meshPatch = meshPatches[patchi];
++    forAll(curPatchSizes, patchi)
++    {
++        // Get the face labels consistent with the field mapping
++        // (reuse the patch field mappers)
++        const polyPatch& meshPatch = meshPatches[patchi];
+ 
+-            fvFieldDecomposer::patchFieldDecomposer patchMapper
++        fvFieldDecomposer::patchFieldDecomposer patchMapper
++        (
++            SubList<label>
+             (
+-                SubList<label>
+-                (
+-                    curFaceLabels,
+-                    curPatchSizes[patchi],
+-                    curPatchStarts[patchi]
+-                ),
+-                meshPatch.start()
+-            );
++                curFaceLabels,
++                curPatchSizes[patchi],
++                curPatchStarts[patchi]
++            ),
++            meshPatch.start()
++        );
+ 
+-            // Map existing patches
+-            procPatches.set
++        // Map existing patches
++        procPatches.set
++        (
++            nPatches,
++            meshPatch.clone
+             (
++                procMesh.boundaryMesh(),
+                 nPatches,
+-                meshPatch.clone
+-                (
+-                    procMesh.boundaryMesh(),
+-                    nPatches,
+-                    patchMapper.directAddressing(),
+-                    curPatchStarts[patchi]
+-                )
+-            );
++                patchMapper.directAddressing(),
++                curPatchStarts[patchi]
++            )
++        );
+ 
+-            nPatches++;
+-        }
++        nPatches++;
++    }
+ 
+-        forAll(curProcessorPatchSizes, procPatchi)
+-        {
+-            const labelList& subPatchID = curSubPatchIDs[procPatchi];
+-            const labelList& subStarts = curSubStarts[procPatchi];
++    forAll(curProcessorPatchSizes, procPatchi)
++    {
++        const labelList& subPatchID = curSubPatchIDs[procPatchi];
++        const labelList& subStarts = curSubStarts[procPatchi];
++
++        label curStart = curProcessorPatchStarts[procPatchi];
+ 
+-            label curStart = curProcessorPatchStarts[procPatchi];
++        forAll(subPatchID, i)
++        {
++            label size =
++            (
++                i < subPatchID.size()-1
++              ? subStarts[i+1] - subStarts[i]
++              : curProcessorPatchSizes[procPatchi] - subStarts[i]
++            );
+ 
+-            forAll(subPatchID, i)
++            if (subPatchID[i] == -1)
+             {
+-                label size =
++                // From internal faces
++                procPatches.set
+                 (
+-                    i < subPatchID.size()-1
+-                  ? subStarts[i+1] - subStarts[i]
+-                  : curProcessorPatchSizes[procPatchi] - subStarts[i]
+-                );
+-
+-                if (subPatchID[i] == -1)
+-                {
+-                    // From internal faces
+-                    procPatches.set
++                    nPatches,
++                    new processorPolyPatch
+                     (
++                        size,
++                        curStart,
+                         nPatches,
+-                        new processorPolyPatch
+-                        (
+-                            size,
+-                            curStart,
+-                            nPatches,
+-                            procMesh.boundaryMesh(),
+-                            proci,
+-                            curNeighbourProcessors[procPatchi]
+-                        )
+-                    );
+-                }
+-                else
+-                {
+-                    const coupledPolyPatch& pcPatch
+-                        = refCast<const coupledPolyPatch>
+-                          (
+-                              boundaryMesh()[subPatchID[i]]
+-                          );
++                        procMesh.boundaryMesh(),
++                        proci,
++                        curNeighbourProcessors[procPatchi]
++                    )
++                );
++            }
++            else
++            {
++                const coupledPolyPatch& pcPatch
++                    = refCast<const coupledPolyPatch>
++                      (
++                          boundaryMesh()[subPatchID[i]]
++                      );
+ 
+-                    procPatches.set
++                procPatches.set
++                (
++                    nPatches,
++                    new processorCyclicPolyPatch
+                     (
++                        size,
++                        curStart,
+                         nPatches,
+-                        new processorCyclicPolyPatch
+-                        (
+-                            size,
+-                            curStart,
+-                            nPatches,
+-                            procMesh.boundaryMesh(),
+-                            proci,
+-                            curNeighbourProcessors[procPatchi],
+-                            pcPatch.name(),
+-                            pcPatch.transform()
+-                        )
+-                    );
+-                }
+-
+-                curStart += size;
+-                ++nPatches;
++                        procMesh.boundaryMesh(),
++                        proci,
++                        curNeighbourProcessors[procPatchi],
++                        pcPatch.name(),
++                        pcPatch.transform()
++                    )
++                );
+             }
++
++            curStart += size;
++            ++nPatches;
+         }
++    }
+ 
+-        // Add boundary patches
++    // Add boundary patches
++    if constexpr (std::is_same_v<MeshType, fvMesh>)
++    {
++        procMesh.addFvPatches(procPatches);
++    }
++    else
++    {
+         procMesh.addPatches(procPatches);
++    }
++
++    // Create and add zones
+ 
+-        // Create and add zones
++    // Point zones
++    {
++        const pointZoneMesh& pz = pointZones();
+ 
+-        // Point zones
++        // Go through all the zoned points and find out if they
++        // belong to a zone.  If so, add it to the zone as
++        // necessary
++        List<DynamicList<label>> zonePoints(pz.size());
++
++        // Estimate size
++        forAll(zonePoints, zonei)
++        {
++            zonePoints[zonei].setCapacity(pz[zonei].size()/nProcs_);
++        }
++
++        // Use the pointToZone_ map to find out the single zone (if any),
++        // use slow search only for shared points.
++        forAll(curPointLabels, pointi)
+         {
+-            const pointZoneMesh& pz = pointZones();
++            label curPoint = curPointLabels[pointi];
+ 
+-            // Go through all the zoned points and find out if they
+-            // belong to a zone.  If so, add it to the zone as
+-            // necessary
+-            List<DynamicList<label>> zonePoints(pz.size());
++            label zonei = pointToZone_[curPoint];
+ 
+-            // Estimate size
+-            forAll(zonePoints, zonei)
++            if (zonei >= 0)
+             {
+-                zonePoints[zonei].setCapacity(pz[zonei].size()/nProcs_);
++                // Single zone.
++                zonePoints[zonei].append(pointi);
+             }
+-
+-            // Use the pointToZone map to find out the single zone (if any),
+-            // use slow search only for shared points.
+-            forAll(curPointLabels, pointi)
++            else if (zonei == -2)
+             {
+-                label curPoint = curPointLabels[pointi];
+-
+-                label zonei = pointToZone[curPoint];
+-
+-                if (zonei >= 0)
++                // Multiple zones. Lookup.
++                forAll(pz, zonei)
+                 {
+-                    // Single zone.
+-                    zonePoints[zonei].append(pointi);
+-                }
+-                else if (zonei == -2)
+-                {
+-                    // Multiple zones. Lookup.
+-                    forAll(pz, zonei)
+-                    {
+-                        label index = pz[zonei].whichPoint(curPoint);
++                    label index = pz[zonei].whichPoint(curPoint);
+ 
+-                        if (index != -1)
+-                        {
+-                            zonePoints[zonei].append(pointi);
+-                        }
++                    if (index != -1)
++                    {
++                        zonePoints[zonei].append(pointi);
+                     }
+                 }
+             }
++        }
+ 
+-            procMesh.pointZones().clearAddressing();
+-            procMesh.pointZones().setSize(zonePoints.size());
+-            forAll(zonePoints, zonei)
+-            {
+-                procMesh.pointZones().set
++        procMesh.pointZones().clearAddressing();
++        procMesh.pointZones().setSize(zonePoints.size());
++        forAll(zonePoints, zonei)
++        {
++            procMesh.pointZones().set
++            (
++                zonei,
++                pz[zonei].clone
+                 (
++                    procMesh.pointZones(),
+                     zonei,
+-                    pz[zonei].clone
+-                    (
+-                        procMesh.pointZones(),
+-                        zonei,
+-                        zonePoints[zonei].shrink()
+-                    )
+-                );
+-            }
++                    zonePoints[zonei].shrink()
++                )
++            );
++        }
+ 
+-            if (pz.size())
+-            {
+-                // Force writing on all processors
+-                procMesh.pointZones().writeOpt(IOobject::AUTO_WRITE);
+-            }
++        if (pz.size())
++        {
++            // Force writing on all processors
++            procMesh.pointZones().writeOpt(IOobject::AUTO_WRITE);
+         }
++    }
+ 
+-        // Face zones
++    // Face zones
++    {
++        const faceZoneMesh& fz = faceZones();
++
++        // Go through all the zoned face and find out if they
++        // belong to a zone.  If so, add it to the zone as
++        // necessary
++        List<DynamicList<label>> zoneFaces(fz.size());
++        List<DynamicList<bool>> zoneFaceFlips(fz.size());
++
++        // Estimate size
++        forAll(zoneFaces, zonei)
+         {
+-            const faceZoneMesh& fz = faceZones();
++            label procSize = fz[zonei].size() / nProcs_;
+ 
+-            // Go through all the zoned face and find out if they
+-            // belong to a zone.  If so, add it to the zone as
+-            // necessary
+-            List<DynamicList<label>> zoneFaces(fz.size());
+-            List<DynamicList<bool>> zoneFaceFlips(fz.size());
++            zoneFaces[zonei].setCapacity(procSize);
++            zoneFaceFlips[zonei].setCapacity(procSize);
++        }
+ 
+-            // Estimate size
+-            forAll(zoneFaces, zonei)
+-            {
+-                label procSize = fz[zonei].size() / nProcs_;
++        // Go through all the zoned faces and find out if they
++        // belong to a zone.  If so, add it to the zone as
++        // necessary
++        forAll(curFaceLabels, facei)
++        {
++            // Remember to decrement the index by one (turning index)
++            //
++            label curF = mag(curFaceLabels[facei]) - 1;
+ 
+-                zoneFaces[zonei].setCapacity(procSize);
+-                zoneFaceFlips[zonei].setCapacity(procSize);
+-            }
++            label zonei = faceToZone_[curF];
+ 
+-            // Go through all the zoned faces and find out if they
+-            // belong to a zone.  If so, add it to the zone as
+-            // necessary
+-            forAll(curFaceLabels, facei)
++            if (zonei >= 0)
+             {
+-                // Remember to decrement the index by one (turning index)
+-                //
+-                label curF = mag(curFaceLabels[facei]) - 1;
++                // Single zone. Add the face
++                zoneFaces[zonei].append(facei);
++
++                label index = fz[zonei].whichFace(curF);
+ 
+-                label zonei = faceToZone[curF];
++                bool flip = fz[zonei].flipMap()[index];
+ 
+-                if (zonei >= 0)
++                if (curFaceLabels[facei] < 0)
+                 {
+-                    // Single zone. Add the face
+-                    zoneFaces[zonei].append(facei);
++                    flip = !flip;
++                }
+ 
++                zoneFaceFlips[zonei].append(flip);
++            }
++            else if (zonei == -2)
++            {
++                // Multiple zones. Lookup.
++                forAll(fz, zonei)
++                {
+                     label index = fz[zonei].whichFace(curF);
+ 
+-                    bool flip = fz[zonei].flipMap()[index];
+-
+-                    if (curFaceLabels[facei] < 0)
++                    if (index != -1)
+                     {
+-                        flip = !flip;
+-                    }
++                        zoneFaces[zonei].append(facei);
+ 
+-                    zoneFaceFlips[zonei].append(flip);
+-                }
+-                else if (zonei == -2)
+-                {
+-                    // Multiple zones. Lookup.
+-                    forAll(fz, zonei)
+-                    {
+-                        label index = fz[zonei].whichFace(curF);
++                        bool flip = fz[zonei].flipMap()[index];
+ 
+-                        if (index != -1)
++                        if (curFaceLabels[facei] < 0)
+                         {
+-                            zoneFaces[zonei].append(facei);
+-
+-                            bool flip = fz[zonei].flipMap()[index];
+-
+-                            if (curFaceLabels[facei] < 0)
+-                            {
+-                                flip = !flip;
+-                            }
+-
+-                            zoneFaceFlips[zonei].append(flip);
++                            flip = !flip;
+                         }
++
++                        zoneFaceFlips[zonei].append(flip);
+                     }
+                 }
+             }
++        }
+ 
+-            procMesh.faceZones().clearAddressing();
+-            procMesh.faceZones().setSize(zoneFaces.size());
+-            forAll(zoneFaces, zonei)
+-            {
+-                procMesh.faceZones().set
++        procMesh.faceZones().clearAddressing();
++        procMesh.faceZones().setSize(zoneFaces.size());
++        forAll(zoneFaces, zonei)
++        {
++            procMesh.faceZones().set
++            (
++                zonei,
++                fz[zonei].clone
+                 (
++                    zoneFaces[zonei].shrink(),          // addressing
++                    zoneFaceFlips[zonei].shrink(),      // flipmap
+                     zonei,
+-                    fz[zonei].clone
+-                    (
+-                        zoneFaces[zonei].shrink(),          // addressing
+-                        zoneFaceFlips[zonei].shrink(),      // flipmap
+-                        zonei,
+-                        procMesh.faceZones()
+-                    )
+-                );
+-            }
++                    procMesh.faceZones()
++                )
++            );
++        }
+ 
+-            if (fz.size())
+-            {
+-                // Force writing on all processors
+-                procMesh.faceZones().writeOpt(IOobject::AUTO_WRITE);
+-            }
++        if (fz.size())
++        {
++            // Force writing on all processors
++            procMesh.faceZones().writeOpt(IOobject::AUTO_WRITE);
++        }
++    }
++
++    // Cell zones
++    {
++        const cellZoneMesh& cz = cellZones();
++
++        // Go through all the zoned cells and find out if they
++        // belong to a zone.  If so, add it to the zone as
++        // necessary
++        List<DynamicList<label>> zoneCells(cz.size());
++
++        // Estimate size
++        forAll(zoneCells, zonei)
++        {
++            zoneCells[zonei].setCapacity(cz[zonei].size()/nProcs_);
+         }
+ 
+-        // Cell zones
++        forAll(curCellLabels, celli)
+         {
+-            const cellZoneMesh& cz = cellZones();
++            label curCelli = curCellLabels[celli];
+ 
+-            // Go through all the zoned cells and find out if they
+-            // belong to a zone.  If so, add it to the zone as
+-            // necessary
+-            List<DynamicList<label>> zoneCells(cz.size());
++            label zonei = cellToZone_[curCelli];
+ 
+-            // Estimate size
+-            forAll(zoneCells, zonei)
++            if (zonei >= 0)
+             {
+-                zoneCells[zonei].setCapacity(cz[zonei].size()/nProcs_);
++                // Single zone.
++                zoneCells[zonei].append(celli);
+             }
+-
+-            forAll(curCellLabels, celli)
++            else if (zonei == -2)
+             {
+-                label curCelli = curCellLabels[celli];
+-
+-                label zonei = cellToZone[curCelli];
+-
+-                if (zonei >= 0)
++                // Multiple zones. Lookup.
++                forAll(cz, zonei)
+                 {
+-                    // Single zone.
+-                    zoneCells[zonei].append(celli);
+-                }
+-                else if (zonei == -2)
+-                {
+-                    // Multiple zones. Lookup.
+-                    forAll(cz, zonei)
+-                    {
+-                        label index = cz[zonei].whichCell(curCelli);
++                    label index = cz[zonei].whichCell(curCelli);
+ 
+-                        if (index != -1)
+-                        {
+-                            zoneCells[zonei].append(celli);
+-                        }
++                    if (index != -1)
++                    {
++                        zoneCells[zonei].append(celli);
+                     }
+                 }
+             }
++        }
+ 
+-            procMesh.cellZones().clearAddressing();
+-            procMesh.cellZones().setSize(zoneCells.size());
+-            forAll(zoneCells, zonei)
+-            {
+-                procMesh.cellZones().set
++        procMesh.cellZones().clearAddressing();
++        procMesh.cellZones().setSize(zoneCells.size());
++        forAll(zoneCells, zonei)
++        {
++            procMesh.cellZones().set
++            (
++                zonei,
++                cz[zonei].clone
+                 (
++                    zoneCells[zonei].shrink(),
+                     zonei,
+-                    cz[zonei].clone
+-                    (
+-                        zoneCells[zonei].shrink(),
+-                        zonei,
+-                        procMesh.cellZones()
+-                    )
+-                );
+-            }
++                    procMesh.cellZones()
++                )
++            );
++        }
+ 
+-            if (cz.size())
+-            {
+-                // Force writing on all processors
+-                procMesh.cellZones().writeOpt(IOobject::AUTO_WRITE);
+-            }
++        if (cz.size())
++        {
++            // Force writing on all processors
++            procMesh.cellZones().writeOpt(IOobject::AUTO_WRITE);
++        }
++    }
++
++    return procMeshPtr;
++}
++
++
++Foam::autoPtr<Foam::fvMesh> Foam::domainDecomposition::processorFvMesh
++(
++    const label proci,
++    const Time& processorDb
++) const
++{
++    auto meshPtr = buildProcMesh<fvMesh>(proci, processorDb);
++    resetProcMeshBuild(proci);
++    return meshPtr;
++}
++
++
++Foam::labelList Foam::domainDecomposition::procBoundaryAddressing
++(
++    const label proci
++) const
++{
++    // Identity map for original patches, -1 for processor patches
++    // (same as written in writeDecomposition)
++    label nProcPatches = 0;
++    for (const labelList& ids : procProcessorPatchSubPatchIDs_[proci])
++    {
++        nProcPatches += ids.size();
++    }
++    const label nMeshPatches = procPatchSize_[proci].size();
++    labelList addr(identity(nMeshPatches));
++    addr.resize(nMeshPatches + nProcPatches, -1);
++    return addr;
++}
++
++
++bool Foam::domainDecomposition::writeDecomposition(const bool decomposeSets)
++{
++    Info<< "\nConstructing processor meshes" << endl;
++
++    initProcMeshBuild();
++
++    PtrDynList<const cellSet> cellSets;
++    PtrDynList<const faceSet> faceSets;
++    PtrDynList<const pointSet> pointSets;
++    if (decomposeSets)
++    {
++        // Read sets
++        IOobjectList objects(*this, facesInstance(), "polyMesh/sets");
++        for (const IOobject& io : objects.csorted<cellSet>())
++        {
++            cellSets.emplace_back(io);
++        }
++        for (const IOobject& io : objects.csorted<faceSet>())
++        {
++            faceSets.emplace_back(io);
++        }
++        for (const IOobject& io : objects.csorted<pointSet>())
++        {
++            pointSets.emplace_back(io);
++        }
++    }
++
++
++    // Load refinement data (if any)
++    hexRef8Data baseMeshData
++    (
++        IOobject
++        (
++            "dummy",
++            facesInstance(),
++            polyMesh::meshSubDir,
++            *this,
++            IOobjectOption::READ_IF_PRESENT,
++            IOobjectOption::NO_WRITE,
++            IOobjectOption::NO_REGISTER
++        )
++    );
++
++
++    label maxProcCells = 0;
++    label maxProcFaces = 0;
++    label totProcFaces = 0;
++    label maxProcPatches = 0;
++    label totProcPatches = 0;
++
++
++    // Write out the meshes
++    for (label proci = 0; proci < nProcs_; proci++)
++    {
++        // create a database
++        Time processorDb
++        (
++            Time::controlDictName,
++            time().rootPath(),
++            time().caseName()/("processor" + Foam::name(proci)),
++            false,  // No function objects
++            false   // No extra controlDict libs
++        );
++        processorDb.setTime(time());
++
++        // Construct the processor mesh (points, faces, cells, patches, zones)
++        autoPtr<polyMesh> procMeshPtr =
++            buildProcMesh<polyMesh>(proci, processorDb);
++        polyMesh& procMesh = procMeshPtr();
++
++        const labelList& curPointLabels = procPointAddressing_[proci];
++        const labelList& curFaceLabels = procFaceAddressing_[proci];
++        const labelList& curCellLabels = procCellAddressing_[proci];
++        const labelList& curPatchSizes = procPatchSize_[proci];
++        const labelList& pointLookup = pointLookup_;
++
++        // Points for writing at pointsInstance (moving mesh case)
++        pointField procPoints;
++        if (facesInstancePointsPtr_)
++        {
++            procPoints = pointField(points(), curPointLabels);
+         }
+ 
+         // More precision (for points data)
+@@ -933,6 +1036,8 @@
+         ).write();
+ 
+ 
++        resetProcMeshBuild(proci);
++
+         // Statistics
+         Info<< nl << "Processor " << proci;
+ 
+--- a/applications/utilities/parallelProcessing/decomposePar/domainDecomposition.H
++++ b/applications/utilities/parallelProcessing/decomposePar/domainDecomposition.H
+@@ -120,6 +120,22 @@
+         List<labelListList> procProcessorPatchSubPatchStarts_;
+ 
+ 
++        // Work data for constructing processor meshes
++
++        //- Lookups/zone markers prepared
++        mutable bool procMeshBuildReady_ = false;
++
++        //- Full-mesh point/face to processor-local index (-1 if unused).
++        //  Allocated once, only touched entries are reset per processor.
++        mutable labelList pointLookup_;
++        mutable labelList faceLookup_;
++
++        //- Single zone per point/face/cell (-1: none, -2: multiple)
++        mutable labelList pointToZone_;
++        mutable labelList faceToZone_;
++        mutable labelList cellToZone_;
++
++
+     // Private Member Functions
+ 
+         void distributeCells();
+@@ -156,6 +172,21 @@
+             BinaryOp bop
+         ) const;
+ 
++        //- Prepare lookups and zone markers (once)
++        void initProcMeshBuild() const;
++
++        //- Reset the lookup entries touched by processor proci
++        void resetProcMeshBuild(const label proci) const;
++
++        //- Construct processor mesh (points, faces, cells, patches, zones).
++        //  Leaves the lookups set for proci; call resetProcMeshBuild after.
++        template<class MeshType>
++        autoPtr<MeshType> buildProcMesh
++        (
++            const label proci,
++            const Time& processorDb
++        ) const;
++
+ 
+ public:
+ 
+@@ -232,6 +263,48 @@
+         //- Write decomposition
+         bool writeDecomposition(const bool decomposeSets);
+ 
++        //- True if the processor meshes can be rebuilt in memory
++        //- (decomposition done, mesh points not from a different instance)
++        bool canBuildProcMeshes() const noexcept
++        {
++            return
++            (
++                !facesInstancePointsPtr_
++             && procCellAddressing_.size() == nProcs_
++             && procPatchSize_.size() == nProcs_
++             && (nProcs_ == 0 || procPatchSize_[0].size())
++            );
++        }
++
++        //- In-memory processor fvMesh, identical to the one written by
++        //- writeDecomposition (avoids reading it back from disk)
++        autoPtr<fvMesh> processorFvMesh
++        (
++            const label proci,
++            const Time& processorDb
++        ) const;
++
++        //- Point addressing (processor to complete mesh) for proci
++        const labelList& procPointAddressing(const label proci) const
++        {
++            return procPointAddressing_[proci];
++        }
++
++        //- Face addressing (with turning index) for proci
++        const labelUList& procFaceAddressing(const label proci) const
++        {
++            return procFaceAddressing_[proci];
++        }
++
++        //- Cell addressing for proci
++        const labelList& procCellAddressing(const label proci) const
++        {
++            return procCellAddressing_[proci];
++        }
++
++        //- Boundary addressing for proci (identity, -1 for processor patches)
++        labelList procBoundaryAddressing(const label proci) const;
++
+ 
+     // Write
+ 
+--- a/applications/utilities/parallelProcessing/decomposePar/domainDecompositionMesh.C
++++ b/applications/utilities/parallelProcessing/decomposePar/domainDecompositionMesh.C
+@@ -434,9 +434,15 @@
+     // used for the processor. Collect the list of used points for the
+     // processor.
+ 
++    // Allocated once, only the used bits are cleared per processor.
++    // The used points are collected while marking: bitSet::sortedToc()
++    // would scan the whole bitSet, O(nPoints) per processor.
++    bitSet pointsInUse(nPoints(), false);
++    DynamicList<label> curPoints;
++
+     forAll(procPointAddressing_, proci)
+     {
+-        bitSet pointsInUse(nPoints(), false);
++        curPoints.clear();
+ 
+         // For each of the faces used
+         for (const label facei : procFaceAddressing_[proci])
+@@ -445,10 +451,18 @@
+             const labelList& facePoints = fcs[mag(facei) - 1];
+ 
+             // Mark the face points as being used
+-            pointsInUse.set(facePoints);
++            for (const label pointi : facePoints)
++            {
++                if (!pointsInUse.test_set(pointi))
++                {
++                    curPoints.push_back(pointi);
++                }
++            }
+         }
+ 
+-        procPointAddressing_[proci] = pointsInUse.sortedToc();
++        Foam::sort(curPoints);
++        procPointAddressing_[proci] = curPoints;
++        pointsInUse.unset(curPoints);
+     }
+ }
+ 

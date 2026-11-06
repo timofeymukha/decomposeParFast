@@ -1,0 +1,7 @@
+# Only the patched sources, the patches and the README are tracked
+/*
+!/.gitignore
+!/README.md
+!/*.patch
+!/decomposeParFast/
+decomposeParFast/Make/linux64*
