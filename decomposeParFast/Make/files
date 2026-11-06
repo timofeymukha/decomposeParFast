@@ -8,4 +8,4 @@ domainDecompositionWrite.C
 domainDecompositionDryRun.C
 domainDecompositionDryRunWrite.C
 
-EXE = $(PWD)/../bin/decomposeParFast
+EXE = $(FOAM_USER_APPBIN)/decomposeParFast

@@ -6,7 +6,7 @@ decomposePar gets slower with every processor it writes, and on large meshes it 
 
 - `0001-ENH-decomposePar-remove-O-nProcs-meshSize-work-and-c.patch` — for the openfoam.com `develop` branch (on top of 9bcf41d9, 2026-11-04). Apply with `git am`.
 - `decomposePar-v2606.patch` — the same change for v2606.
-- `decomposeParFast/` — the patched v2606 sources, which build as a separate executable `decomposeParFast`.
+- `decomposeParFast/` — the patched v2606 sources, which build as a separate executable. Running `wmake` in that directory installs `decomposeParFast` into `$FOAM_USER_APPBIN`.
 
 ## Changes
 
